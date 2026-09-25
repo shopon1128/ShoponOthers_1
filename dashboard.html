@@ -1,0 +1,792 @@
+<title>作業盤</title>
+<!--
+  作業盤: Claude が自律的に作業するときのダッシュボードのテンプレート
+  (claude.ai の Artifact として公開し、スマホからも見て答える)
+
+  ■ Claude への手順
+  1. このファイル(プロジェクトルートの dashboard.html)の <title> を「<プロジェクト名> 作業盤」に変える
+  2. Artifact ツールで公開する。capabilities は {"db": {}}、icon は "checklist"。
+     公開した URL を、プロジェクトの CLAUDE.md の「プロジェクト情報」に書く(次のセッションからは url を指定して更新する)
+  3. データは ArtifactData ツールで読み書きする。何件もまとめて書くときは batch を使う
+  4. 運用
+     - 着手時と区切りごとに meta/status を更新する(state が working のまま updatedAt が30分以上古いと、ページに警告が出る)
+     - 判断が分かれる点は questions に積む。回答を待つあいだは、その答えに左右されない作業を先に進める。
+       答えがないと先へ進めないものは blocking: true にする。
+       質問を積んだら、PushNotification ツールが使える環境ならスマホへ通知する(本文は質問の要点を1行で)
+     - タスクを1つ終えるたびに、次のものを読んで反映する: 回答済みの questions、status が "new" の inbox と reviews、objection のある decisions。
+       反映したら status を更新し、reply に何をしたかを一言書く
+     - 仮定を置いて進めた判断は decisions に残す。検証の結果は checks に書く(CLAUDE.md の「確認済み/未検証」と同じ区別)
+     - 成果物は deliverables に、最新版の url と version を書く
+
+  ■ データ構造(パスは コレクション/ドキュメントID。日時はすべて ISO 8601 の文字列)
+  meta/status       { project, state: "working"|"waiting"|"blocked"|"done", now: いま何をしているか, updatedAt }
+  questions/<id>    { text, context?, options?: string[], recommended?: options の添字, blocking?: bool,
+                      askedAt, status: "open"|"answered", answer?, answeredAt? }      ← answer 以降はページが書く
+  tasks/<id>        { title, status: "todo"|"doing"|"done"|"blocked", note?, order?: number, updatedAt }
+  deliverables/<id> { title, url?, version?, summary?, updatedAt }
+  reviews/<id>      { deliverableId, text, createdAt, status: "new"|"done", reply? }  ← ページが作る
+  checks/<id>       { item, state: "verified"|"unverified"|"failed", how?, updatedAt }
+  decisions/<id>    { text, reason?, createdAt, objection?, objectedAt?, reply? }     ← objection はページが書く
+  inbox/<id>        { text, createdAt, status: "new"|"seen", reply? }                 ← ページが作る
+
+  ■ 欄を減らすとき
+  使わない欄の <section> と、概要の対応するタイル(<a class="tile">)を消す。スクリプトは、存在しない欄の描画を飛ばす
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+JP:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f3f4f7;
+    --surface: #ffffff;
+    --ink: #1b2130;
+    --muted: #566073;
+    --line: #d7dbe3;
+    --accent: #2a55b8;
+    --accent-weak: #e5ebf8;
+    --ok: #1c6f43;
+    --ok-weak: #e1f0e7;
+    --warn: #8f5100;
+    --warn-weak: #f7ecda;
+    --bad: #ad261e;
+    --bad-weak: #f8e2e0;
+    --font-body: "IBM Plex Sans JP", "Hiragino Sans", "Yu Gothic", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #11141b;
+      --surface: #1a1f29;
+      --ink: #e4e8ef;
+      --muted: #9aa3b4;
+      --line: #2e3544;
+      --accent: #86a6ff;
+      --accent-weak: #222c45;
+      --ok: #7fd3a2;
+      --ok-weak: #19302a;
+      --warn: #f0b764;
+      --warn-weak: #35291a;
+      --bad: #ff9a92;
+      --bad-weak: #3a2124;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #11141b;
+    --surface: #1a1f29;
+    --ink: #e4e8ef;
+    --muted: #9aa3b4;
+    --line: #2e3544;
+    --accent: #86a6ff;
+    --accent-weak: #222c45;
+    --ok: #7fd3a2;
+    --ok-weak: #19302a;
+    --warn: #f0b764;
+    --warn-weak: #35291a;
+    --bad: #ff9a92;
+    --bad-weak: #3a2124;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.65;
+  }
+  .page {
+    max-width: 760px;
+    margin-inline: auto;
+    padding-inline: 16px;
+    padding-block: 20px 56px;
+    display: grid;
+    gap: 28px;
+  }
+  h1, h2 { text-wrap: balance; margin: 0; line-height: 1.3; }
+  h1 { font-size: 1.45rem; font-weight: 600; }
+  h2 { font-size: 1.05rem; font-weight: 600; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .small { font-size: 0.82rem; }
+  .pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  /* ヘッダー: いまの状態 */
+  .masthead { display: grid; gap: 8px; }
+  .masthead-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  .now { font-size: 1rem; }
+  .banner {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-size: 0.88rem;
+  }
+  .banner--warn { background: var(--warn-weak); color: var(--warn); border-color: transparent; }
+  .banner--info { background: var(--accent-weak); color: var(--ink); border-color: transparent; }
+
+  /* 概要タイル: 人の対応が要る数 */
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .tile {
+    display: grid;
+    gap: 2px;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .tile-num { font-family: var(--font-mono); font-size: 1.6rem; font-weight: 500; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .tile-label { font-size: 0.78rem; color: var(--muted); letter-spacing: 0.02em; }
+  .tile--hot { border-color: var(--accent); }
+  .tile--hot .tile-num { color: var(--accent); }
+  @media (max-width: 560px) {
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  /* 各欄 */
+  .panel { display: grid; gap: 12px; }
+  .panel-head { display: flex; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  .panel-body { display: grid; gap: 10px; }
+  .panel-count {font-family: var(--font-mono); font-size: 0.85rem; color: var(--muted); }
+  .list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+  }
+  .card--attention { border-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .row--between { justify-content: space-between; }
+  .line-item { display: flex; gap: 10px; align-items: flex-start; padding-block: 6px; border-bottom: 1px solid var(--line); }
+  .line-item:last-child { border-bottom: none; }
+  .line-item > .chip { flex: none; margin-top: 2px; }
+  .line-body { min-width: 0; display: grid; gap: 2px; }
+  .empty { color: var(--muted); font-size: 0.9rem; }
+
+  .chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+    background: var(--bg);
+    color: var(--muted);
+    border: 1px solid var(--line);
+  }
+  .chip--ok { background: var(--ok-weak); color: var(--ok); border-color: transparent; }
+  .chip--warn { background: var(--warn-weak); color: var(--warn); border-color: transparent; }
+  .chip--bad { background: var(--bad-weak); color: var(--bad); border-color: transparent; }
+  .chip--accent { background: var(--accent-weak); color: var(--accent); border-color: transparent; }
+
+  .reply { border-left: 2px solid var(--line); padding-left: 10px; font-size: 0.88rem; }
+
+  /* 入力 */
+  .field { display: grid; gap: 4px; }
+  .field label { font-size: 0.8rem; color: var(--muted); }
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 64px;
+    resize: vertical;
+    padding: 8px 10px;
+    font: inherit;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .options { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    font: inherit;
+    font-size: 0.88rem;
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 6px 14px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink);
+  }
+  button:disabled { opacity: 0.55; cursor: progress; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--surface); font-weight: 500; }
+  .btn-option[aria-pressed="true"] { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+  .btn-quiet { border-color: transparent; background: transparent; color: var(--accent); padding-inline: 4px; }
+
+  details > summary { cursor: pointer; color: var(--muted); font-size: 0.88rem; }
+  details[open] > summary { margin-bottom: 8px; }
+
+  .toast {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    max-width: 480px;
+    margin-inline: auto;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    background: var(--ink);
+    color: var(--bg);
+    font-size: 0.88rem;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .toast { transition: opacity 0.2s; }
+  }
+</style>
+
+<main class="page">
+  <header class="masthead">
+    <div class="masthead-row">
+      <h1 id="project-name">作業盤</h1>
+      <span id="state-chip" class="chip">読み込み中</span>
+    </div>
+    <p id="now" class="now"></p>
+    <p id="updated" class="small muted mono"></p>
+    <p id="stale" class="banner banner--warn" hidden>30分以上、更新がありません。Claude が止まっているかもしれません。</p>
+    <p id="notice" class="banner banner--info" hidden></p>
+  </header>
+
+  <nav class="tiles" aria-label="対応が要るもの">
+    <a class="tile" id="tile-questions" href="#sec-questions"><span class="tile-num">–</span><span class="tile-label">未回答の質問</span></a>
+    <a class="tile" id="tile-tasks" href="#sec-tasks"><span class="tile-num">–</span><span class="tile-label">作業中のタスク</span></a>
+    <a class="tile" id="tile-reviews" href="#sec-deliverables"><span class="tile-num">–</span><span class="tile-label">未対応のレビュー</span></a>
+    <a class="tile" id="tile-checks" href="#sec-checks"><span class="tile-num">–</span><span class="tile-label">未検証・失敗</span></a>
+  </nav>
+
+  <section class="panel" id="sec-questions">
+    <div class="panel-head"><h2>Claude からの質問</h2><span class="panel-count" id="count-questions"></span></div>
+    <div class="panel-body" id="body-questions"></div>
+  </section>
+
+  <section class="panel" id="sec-inbox">
+    <div class="panel-head"><h2>Claude への指示</h2><span class="panel-count" id="count-inbox"></span></div>
+    <div class="panel-body" id="body-inbox"></div>
+  </section>
+
+  <section class="panel" id="sec-tasks">
+    <div class="panel-head"><h2>タスク</h2><span class="panel-count" id="count-tasks"></span></div>
+    <div class="panel-body" id="body-tasks"></div>
+  </section>
+
+  <section class="panel" id="sec-deliverables">
+    <div class="panel-head"><h2>成果物とレビュー</h2><span class="panel-count" id="count-deliverables"></span></div>
+    <div class="panel-body" id="body-deliverables"></div>
+  </section>
+
+  <section class="panel" id="sec-checks">
+    <div class="panel-head"><h2>検証状況</h2><span class="panel-count" id="count-checks"></span></div>
+    <div class="panel-body" id="body-checks"></div>
+  </section>
+
+  <section class="panel" id="sec-decisions">
+    <div class="panel-head"><h2>判断ログ</h2><span class="panel-count" id="count-decisions"></span></div>
+    <div class="panel-body" id="body-decisions"></div>
+  </section>
+</main>
+
+<p id="toast" class="toast" role="status" hidden></p>
+
+<script>
+(() => {
+  "use strict";
+
+  // 状態が working のまま、この分数を超えて更新がなければ停止を疑う
+  const STALE_MINUTES = 30;
+  const TOAST_MS = 3200;
+  const INBOX_SHOWN = 10;
+  const COLLECTIONS = ["questions", "tasks", "deliverables", "reviews", "checks", "decisions", "inbox"];
+
+  // 表示ラベルと色。状態を増やすときはここに足す
+  const STATE_VIEW = {
+    working: ["作業中", "chip--accent"],
+    waiting: ["回答待ち", "chip--warn"],
+    blocked: ["停止中", "chip--bad"],
+    done: ["完了", "chip--ok"],
+  };
+  const TASK_VIEW = {
+    blocked: ["停止", "chip--bad"],
+    doing: ["作業中", "chip--accent"],
+    todo: ["未着手", ""],
+    done: ["完了", "chip--ok"],
+  };
+  const CHECK_VIEW = {
+    failed: ["失敗", "chip--bad"],
+    unverified: ["未検証", "chip--warn"],
+    verified: ["確認済み", "chip--ok"],
+  };
+  const TASK_ORDER = ["blocked", "doing", "todo", "done"];
+  const CHECK_ORDER = ["failed", "unverified", "verified"];
+
+  const store = { meta: null, questions: [], tasks: [], deliverables: [], reviews: [], checks: [], decisions: [], inbox: [] };
+  const drafts = {};
+  let db = null;
+
+  // ---- 小さな道具 ----
+  function h(tag, props, ...children) {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === "class") el.className = value;
+      else if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
+      else el.setAttribute(key, value === true ? "" : String(value));
+    }
+    for (const child of children.flat()) {
+      if (child === null || child === undefined || child === false) continue;
+      // 文字列は必ずテキストノードとして入れる(外部由来の値を HTML として解釈させない)
+      el.append(child instanceof Node ? child : String(child));
+    }
+    return el;
+  }
+
+  function chip(view) {
+    const [label, cls] = view || ["不明", ""];
+    return h("span", { class: `chip ${cls}` }, label);
+  }
+
+  function minutesSince(iso) {
+    const time = Date.parse(iso || "");
+    return Number.isNaN(time) ? null : (Date.now() - time) / 60000;
+  }
+
+  function timeAgo(iso) {
+    const min = minutesSince(iso);
+    if (min === null) return "";
+    if (min < 1) return "たった今";
+    if (min < 60) return `${Math.round(min)}分前`;
+    const hours = Math.round(min / 60);
+    if (hours < 24) return `${hours}時間前`;
+    return `${Math.round(hours / 24)}日前`;
+  }
+
+  function byTime(field, dir) {
+    const sign = dir === "desc" ? -1 : 1;
+    return (a, b) => sign * ((Date.parse(a[field] || "") || 0) - (Date.parse(b[field] || "") || 0));
+  }
+
+  function safeUrl(raw) {
+    try {
+      const url = new URL(String(raw));
+      return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function textField(id, label, placeholder) {
+    return h("div", { class: "field" },
+      h("label", { for: id }, label),
+      h("textarea", {
+        id,
+        placeholder,
+        oninput: (e) => { drafts[id] = e.target.value; },
+      }, drafts[id] || ""),
+    );
+  }
+
+  // 描画し直しても、入力中の欄のフォーカスとカーソル位置を保つ
+  function renderInto(bodyId, nodes) {
+    const box = document.getElementById(bodyId);
+    if (!box) return false;
+    const active = document.activeElement;
+    const activeId = active && box.contains(active) ? active.id : "";
+    const selection = activeId && typeof active.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null;
+    box.replaceChildren(...nodes);
+    if (activeId) {
+      const el = document.getElementById(activeId);
+      if (el) {
+        el.focus();
+        if (selection && el.setSelectionRange) el.setSelectionRange(selection[0], selection[1]);
+      }
+    }
+    return true;
+  }
+
+  function setCount(name, text) {
+    const el = document.getElementById(`count-${name}`);
+    if (el) el.textContent = text;
+  }
+
+  function setTile(name, count) {
+    const tile = document.getElementById(`tile-${name}`);
+    if (!tile) return;
+    tile.querySelector(".tile-num").textContent = String(count);
+    tile.classList.toggle("tile--hot", count > 0);
+  }
+
+  let toastTimer = 0;
+  function showToast(message) {
+    const el = document.getElementById("toast");
+    el.textContent = message;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, TOAST_MS);
+  }
+
+  function errorText(err) {
+    const code = err && err.code;
+    if (code === "invalid_argument") return "保存できませんでした。この共有の権限では書き込めません。";
+    if (code === "quota_exceeded") return "保存できる件数の上限に達しました。古い記録を消してから、もう一度送ってください。";
+    return "保存できませんでした。通信状態を確かめて、もう一度押してください。";
+  }
+
+  // 書き込みは必ずここを通す。サンプル表示中は保存しない
+  async function save(button, action, clearIds) {
+    if (!db) {
+      showToast("サンプル表示のため、保存はされません。");
+      return;
+    }
+    button.disabled = true;
+    try {
+      await action();
+      for (const id of clearIds) delete drafts[id];
+      showToast("送りました。");
+    } catch (err) {
+      showToast(errorText(err));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  // ---- 各欄の描画 ----
+  function renderHeader() {
+    const meta = store.meta || {};
+    document.getElementById("project-name").textContent = meta.project || document.title;
+    const stateChip = document.getElementById("state-chip");
+    const [label, cls] = STATE_VIEW[meta.state] || ["状態なし", ""];
+    stateChip.className = `chip ${cls}`;
+    stateChip.textContent = label;
+    document.getElementById("now").textContent = meta.now || "Claude からの状態の報告はまだありません。";
+    document.getElementById("updated").textContent = meta.updatedAt ? `最終更新 ${timeAgo(meta.updatedAt)}` : "";
+    const min = minutesSince(meta.updatedAt);
+    document.getElementById("stale").hidden = !(meta.state === "working" && min !== null && min > STALE_MINUTES);
+  }
+
+  function renderQuestions() {
+    const open = store.questions.filter((q) => q.status !== "answered")
+      .sort((a, b) => (b.blocking ? 1 : 0) - (a.blocking ? 1 : 0) || byTime("askedAt")(a, b));
+    const answered = store.questions.filter((q) => q.status === "answered").sort(byTime("answeredAt", "desc"));
+    setCount("questions", `未回答 ${open.length}`);
+    setTile("questions", open.length);
+
+    const cards = open.map((q) => {
+      const optKey = `q-${q.id}-opt`;
+      const noteId = `q-${q.id}-note`;
+      const options = Array.isArray(q.options) ? q.options : [];
+      const optionButtons = options.map((opt, i) => h("button", {
+        type: "button",
+        class: "btn-option",
+        "aria-pressed": drafts[optKey] === i ? "true" : "false",
+        onclick: () => {
+          drafts[optKey] = drafts[optKey] === i ? undefined : i;
+          renderQuestions();
+        },
+      }, opt, q.recommended === i ? "(推奨)" : ""));
+
+      const submit = h("button", {
+        type: "button",
+        class: "btn-primary",
+        onclick: (e) => {
+          const picked = typeof drafts[optKey] === "number" ? options[drafts[optKey]] : "";
+          const note = (drafts[noteId] || "").trim();
+          if (!picked && !note) {
+            showToast("選択肢を選ぶか、回答を書いてください。");
+            return;
+          }
+          const answer = [picked, note && (picked ? `補足: ${note}` : note)].filter(Boolean).join("\n");
+          save(e.currentTarget, () => db.doc(`questions/${q.id}`).update({
+            status: "answered",
+            answer,
+            answeredAt: new Date().toISOString(),
+          }), [optKey, noteId]);
+        },
+      }, "回答する");
+
+      return h("li", { class: `card ${q.blocking ? "card--attention" : ""}` },
+        h("div", { class: "row" },
+          q.blocking ? h("span", { class: "chip chip--bad" }, "作業を止めている") : null,
+          h("span", { class: "small muted mono" }, timeAgo(q.askedAt))),
+        h("p", { class: "pre" }, q.text || ""),
+        q.context ? h("p", { class: "pre small muted" }, q.context) : null,
+        optionButtons.length ? h("div", { class: "options" }, optionButtons) : null,
+        textField(noteId, options.length ? "補足(任意)" : "回答", options.length ? "選んだ理由や条件があれば" : "回答を書く"),
+        h("div", { class: "row" }, submit),
+      );
+    });
+
+    const answeredList = answered.length ? h("details", {},
+      h("summary", {}, `回答済み(${answered.length})`),
+      h("ul", { class: "list" }, answered.map((q) => h("li", { class: "card" },
+        h("p", { class: "pre small muted" }, q.text || ""),
+        h("p", { class: "pre" }, q.answer || ""),
+        h("span", { class: "small muted mono" }, timeAgo(q.answeredAt)),
+      ))),
+    ) : null;
+
+    renderInto("body-questions", [
+      cards.length ? h("ul", { class: "list" }, cards) : h("p", { class: "empty" }, "未回答の質問はありません。"),
+      answeredList,
+    ]);
+  }
+
+  function renderInbox() {
+    const items = [...store.inbox].sort(byTime("createdAt", "desc"));
+    const unread = items.filter((m) => m.status !== "seen").length;
+    setCount("inbox", `未読 ${unread}`);
+    const inputId = "inbox-new";
+    const send = h("button", {
+      type: "button",
+      class: "btn-primary",
+      onclick: (e) => {
+        const text = (drafts[inputId] || "").trim();
+        if (!text) {
+          showToast("指示を書いてから送ってください。");
+          return;
+        }
+        save(e.currentTarget, () => db.collection("inbox").add({ text, createdAt: new Date().toISOString(), status: "new" }), [inputId]);
+      },
+    }, "送る");
+
+    renderInto("body-inbox", [
+      h("div", { class: "card" },
+        textField(inputId, "Claude が次の区切りで読みます", "方針の変更、追加の依頼、優先順位など"),
+        h("div", { class: "row" }, send)),
+      items.length ? h("ul", { class: "list" }, items.slice(0, INBOX_SHOWN).map((m) => h("li", { class: "line-item" },
+        chip(m.status === "seen" ? ["既読", "chip--ok"] : ["未読", "chip--warn"]),
+        h("div", { class: "line-body" },
+          h("p", { class: "pre" }, m.text || ""),
+          m.reply ? h("p", { class: "reply pre muted" }, m.reply) : null,
+          h("span", { class: "small muted mono" }, timeAgo(m.createdAt))),
+      ))) : null,
+    ]);
+  }
+
+  function renderTasks() {
+    const rank = (t) => {
+      const i = TASK_ORDER.indexOf(t.status);
+      return i < 0 ? TASK_ORDER.length : i;
+    };
+    const tasks = [...store.tasks].sort((a, b) => rank(a) - rank(b) || (a.order ?? 0) - (b.order ?? 0));
+    const active = tasks.filter((t) => t.status !== "done");
+    const done = tasks.filter((t) => t.status === "done");
+    const doing = tasks.filter((t) => t.status === "doing").length;
+    setCount("tasks", `完了 ${done.length} / ${tasks.length}`);
+    setTile("tasks", doing);
+
+    const line = (t) => h("li", { class: "line-item" },
+      chip(TASK_VIEW[t.status]),
+      h("div", { class: "line-body" },
+        h("p", {}, t.title || ""),
+        t.note ? h("p", { class: "pre small muted" }, t.note) : null));
+
+    renderInto("body-tasks", [
+      active.length ? h("ul", { class: "list card" }, active.map(line)) : h("p", { class: "empty" }, "残っているタスクはありません。"),
+      done.length ? h("details", {}, h("summary", {}, `完了したタスク(${done.length})`), h("ul", { class: "list card" }, done.map(line))) : null,
+    ]);
+  }
+
+  function renderDeliverables() {
+    const items = [...store.deliverables].sort(byTime("updatedAt", "desc"));
+    const pending = store.reviews.filter((r) => r.status !== "done").length;
+    setCount("deliverables", `${items.length} 件`);
+    setTile("reviews", pending);
+
+    const cards = items.map((d) => {
+      const inputId = `rv-${d.id}`;
+      const href = safeUrl(d.url);
+      const reviews = store.reviews.filter((r) => r.deliverableId === d.id).sort(byTime("createdAt", "desc"));
+      const send = h("button", {
+        type: "button",
+        onclick: (e) => {
+          const text = (drafts[inputId] || "").trim();
+          if (!text) {
+            showToast("レビューを書いてから送ってください。");
+            return;
+          }
+          save(e.currentTarget, () => db.collection("reviews").add({
+            deliverableId: d.id,
+            text,
+            createdAt: new Date().toISOString(),
+            status: "new",
+          }), [inputId]);
+        },
+      }, "レビューを送る");
+
+      return h("li", { class: "card" },
+        h("div", { class: "row row--between" },
+          href ? h("a", { href, target: "_blank", rel: "noopener" }, d.title || href) : h("strong", {}, d.title || "(無題)"),
+          h("span", { class: "small muted mono" }, [d.version ? `v${d.version}` : "", timeAgo(d.updatedAt)].filter(Boolean).join(" · "))),
+        d.summary ? h("p", { class: "pre small" }, d.summary) : null,
+        reviews.length ? h("ul", { class: "list" }, reviews.map((r) => h("li", { class: "line-item" },
+          chip(r.status === "done" ? ["対応済み", "chip--ok"] : ["未対応", "chip--warn"]),
+          h("div", { class: "line-body" },
+            h("p", { class: "pre" }, r.text || ""),
+            r.reply ? h("p", { class: "reply pre muted" }, r.reply) : null,
+            h("span", { class: "small muted mono" }, timeAgo(r.createdAt))),
+        ))) : null,
+        textField(inputId, "レビュー", "気になった点を一言でも"),
+        h("div", { class: "row" }, send),
+      );
+    });
+
+    renderInto("body-deliverables", [
+      cards.length ? h("ul", { class: "list" }, cards) : h("p", { class: "empty" }, "成果物はまだありません。"),
+    ]);
+  }
+
+  function renderChecks() {
+    const rank = (c) => {
+      const i = CHECK_ORDER.indexOf(c.state);
+      return i < 0 ? CHECK_ORDER.length : i;
+    };
+    const items = [...store.checks].sort((a, b) => rank(a) - rank(b));
+    const open = items.filter((c) => c.state !== "verified").length;
+    setCount("checks", `確認済み ${items.length - open} / ${items.length}`);
+    setTile("checks", open);
+    renderInto("body-checks", [
+      items.length ? h("ul", { class: "list card" }, items.map((c) => h("li", { class: "line-item" },
+        chip(CHECK_VIEW[c.state]),
+        h("div", { class: "line-body" },
+          h("p", {}, c.item || ""),
+          c.how ? h("p", { class: "pre small muted" }, c.how) : null),
+      ))) : h("p", { class: "empty" }, "検証の記録はまだありません。"),
+    ]);
+  }
+
+  function renderDecisions() {
+    const items = [...store.decisions].sort(byTime("createdAt", "desc"));
+    setCount("decisions", `${items.length} 件`);
+    const cards = items.map((d) => {
+      const inputId = `dc-${d.id}`;
+      const openKey = `dc-${d.id}-open`;
+      let objection;
+      if (d.objection) {
+        objection = h("div", { class: "reply" },
+          h("p", { class: "pre" }, `異議: ${d.objection}`),
+          d.reply ? h("p", { class: "pre muted" }, d.reply) : h("p", { class: "small muted" }, "Claude の対応待ち"));
+      } else if (drafts[openKey]) {
+        const send = h("button", {
+          type: "button",
+          class: "btn-primary",
+          onclick: (e) => {
+            const text = (drafts[inputId] || "").trim();
+            if (!text) {
+              showToast("異議の内容を書いてください。");
+              return;
+            }
+            save(e.currentTarget, () => db.doc(`decisions/${d.id}`).update({ objection: text, objectedAt: new Date().toISOString() }), [inputId, openKey]);
+          },
+        }, "異議を送る");
+        objection = h("div", { class: "field" }, textField(inputId, "どこが違うか", "望む判断と、その理由"), h("div", { class: "row" }, send));
+      } else {
+        objection = h("div", {}, h("button", {
+          type: "button",
+          class: "btn-quiet",
+          onclick: () => {
+            drafts[openKey] = true;
+            renderDecisions();
+            const el = document.getElementById(inputId);
+            if (el) el.focus();
+          },
+        }, "この判断に異議を書く"));
+      }
+      return h("li", { class: "card" },
+        h("p", { class: "pre" }, d.text || ""),
+        d.reason ? h("p", { class: "pre small muted" }, `理由: ${d.reason}`) : null,
+        h("span", { class: "small muted mono" }, timeAgo(d.createdAt)),
+        objection);
+    });
+    renderInto("body-decisions", [
+      cards.length ? h("ul", { class: "list" }, cards) : h("p", { class: "empty" }, "記録された判断はまだありません。"),
+    ]);
+  }
+
+  const RENDERERS = {
+    questions: renderQuestions,
+    inbox: renderInbox,
+    tasks: renderTasks,
+    deliverables: renderDeliverables,
+    reviews: renderDeliverables,
+    checks: renderChecks,
+    decisions: renderDecisions,
+  };
+
+  function renderAll() {
+    renderHeader();
+    for (const render of new Set(Object.values(RENDERERS))) render();
+  }
+
+  // ---- サンプル(claude.ai の外で開いたときの見本) ----
+  function loadSample() {
+    const ago = (min) => new Date(Date.now() - min * 60000).toISOString();
+    store.meta = { project: "サンプルプロジェクト", state: "working", now: "ログイン画面のフォーム検証を実装中", updatedAt: ago(4) };
+    store.questions = [
+      { id: "q1", text: "パスワードの最小文字数はいくつにしますか?", context: "既存の仕様書に記載がありません。", options: ["8文字", "12文字", "制限なし"], recommended: 1, blocking: true, askedAt: ago(12), status: "open" },
+      { id: "q2", text: "エラーメッセージは日本語のみで良いですか?", askedAt: ago(90), status: "answered", answer: "日本語のみで良い", answeredAt: ago(60) },
+    ];
+    store.tasks = [
+      { id: "t1", title: "ログイン画面のフォーム検証", status: "doing", order: 1 },
+      { id: "t2", title: "パスワード再設定メール", status: "blocked", note: "q1 の回答待ち", order: 2 },
+      { id: "t3", title: "ルーティングの整理", status: "done", order: 0 },
+    ];
+    store.deliverables = [{ id: "d1", title: "ログイン画面(試作)", url: "https://example.com/", version: "3", summary: "入力欄とエラー表示まで。送信処理は未接続。", updatedAt: ago(20) }];
+    store.reviews = [{ id: "r1", deliverableId: "d1", text: "ボタンが小さい", createdAt: ago(18), status: "done", reply: "高さを44pxに変更(v3)" }];
+    store.checks = [
+      { id: "c1", item: "空欄で送信するとエラーが出る", state: "verified", how: "ブラウザで確認" },
+      { id: "c2", item: "スマホ幅(375px)で崩れない", state: "unverified" },
+    ];
+    store.decisions = [{ id: "k1", text: "フォーム検証はサーバ側を正とし、JS 側は表示だけにした", reason: "web-dev.md の規約", createdAt: ago(40) }];
+    store.inbox = [{ id: "m1", text: "デザインは後回しで良い", createdAt: ago(120), status: "seen", reply: "機能を優先します" }];
+    const notice = document.getElementById("notice");
+    notice.textContent = "サンプル表示です。claude.ai で公開したページを開くと、実際のデータに切り替わります。";
+    notice.hidden = false;
+    renderAll();
+  }
+
+  // ---- データベースへの接続 ----
+  function onDbError() {
+    const notice = document.getElementById("notice");
+    notice.textContent = "データの読み込みが止まりました。ページを再読み込みしてください。";
+    notice.hidden = false;
+  }
+
+  function subscribe() {
+    db.doc("meta/status").onSnapshot((snap) => {
+      store.meta = snap.exists ? snap.data() : null;
+      renderHeader();
+    }, onDbError);
+    for (const name of COLLECTIONS) {
+      db.collection(name).onSnapshot((snap) => {
+        store[name] = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        RENDERERS[name]();
+      }, onDbError);
+    }
+  }
+
+  renderAll();
+  // 相対時刻と停止の警告を、書き込みなしで1分ごとに更新する
+  setInterval(() => { if (store.meta) renderHeader(); }, 60000);
+
+  const claude = window.claude;
+  if (!claude || typeof claude.use !== "function") {
+    loadSample();
+  } else {
+    claude.use("db").then((found) => {
+      if (!found) {
+        loadSample();
+        return;
+      }
+      db = found;
+      subscribe();
+    });
+  }
+})();
+</script>
